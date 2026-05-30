@@ -8,6 +8,7 @@ import contextlib
 from typing import Any, Dict, Optional
 
 from mcp.server import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .access_control import AccessController
 from .config import OdooConfig, get_config
@@ -62,6 +63,9 @@ class OdooMCPServer:
             name="odoo-mcp-server",
             instructions="MCP server for accessing and managing Odoo ERP data through the Model Context Protocol",
             lifespan=self._odoo_lifespan,
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=False,
+            ),
         )
 
         @self.app.custom_route("/health", methods=["GET"])
