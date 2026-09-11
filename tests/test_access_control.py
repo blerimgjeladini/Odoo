@@ -4,6 +4,7 @@ This module tests the AccessController class and its integration with
 the Odoo MCP module's REST API endpoints.
 """
 
+import io
 import json
 import os
 import time
@@ -15,10 +16,9 @@ import pytest
 from mcp_server_odoo.access_control import (
     AccessControlError,
     AccessController,
+    access_denied_message,
 )
 from mcp_server_odoo.config import OdooConfig
-
-from .conftest import ODOO_SERVER_AVAILABLE
 
 
 class TestAccessControl:
@@ -103,6 +103,51 @@ class TestAccessControl:
         mock_urlopen.side_effect = urllib.error.HTTPError(None, 401, "Unauthorized", {}, None)
 
         with pytest.raises(AccessControlError, match="API key rejected"):
+            controller._make_request("/test/endpoint")
+
+    @patch("urllib.request.urlopen")
+    def test_make_request_http_403_surfaces_the_module_message(self, mock_urlopen, controller):
+        """The module says exactly what was refused — keep its wording.
+
+        Replacing it with a generic denial sends users hunting a credential
+        problem when the real cause is an un-enabled model.
+        """
+        body = json.dumps(
+            {
+                "success": False,
+                "error": {
+                    "message": "Model 'ir.attachment' is not enabled for MCP access.",
+                    "code": "E403",
+                },
+            }
+        ).encode("utf-8")
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            None, 403, "Forbidden", {}, io.BytesIO(body)
+        )
+
+        with pytest.raises(AccessControlError, match="not enabled for MCP access"):
+            controller._make_request("/test/endpoint")
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"<html>not json</html>",
+            json.dumps({"success": False}).encode("utf-8"),
+            json.dumps({"success": False, "error": {"message": "   "}}).encode("utf-8"),
+            json.dumps({"success": False, "error": {"message": None}}).encode("utf-8"),
+        ],
+        ids=["not-json", "no-error-key", "blank-message", "null-message"],
+    )
+    @patch("urllib.request.urlopen")
+    def test_make_request_http_403_falls_back_when_body_is_unusable(
+        self, mock_urlopen, controller, body
+    ):
+        """An unreadable or empty body must not produce an empty error string."""
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            None, 403, "Forbidden", {}, io.BytesIO(body)
+        )
+
+        with pytest.raises(AccessControlError, match="Access denied to MCP endpoints"):
             controller._make_request("/test/endpoint")
 
     @patch("urllib.request.urlopen")
@@ -285,6 +330,104 @@ class TestAccessControl:
         allowed, msg = controller.check_operation_allowed("res.partner", "write")
         assert allowed is False
         assert "Operation 'write' not allowed" in msg
+
+    @patch("urllib.request.urlopen")
+    def test_password_fallback_does_not_send_rejected_api_key(self, mock_urlopen):
+        """After a password-auth fallback, permission checks must use session
+        auth instead of resending the API key Odoo already rejected."""
+        from mcp_server_odoo.config import OdooConfig
+
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="rejected_key",
+            username="admin",
+            password="admin",
+            database="test_db",
+        )
+        controller = AccessController(config, auth_method="password")
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"success": True, "data": {"models": []}}
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        with patch.object(controller, "_ensure_session") as mock_session:
+            # The header must be built from _ensure_session's return value:
+            # a concurrent 401 handler nulls the attribute, so leave it None
+            # here — code that re-reads it would send "session_id=None".
+            mock_session.return_value = "fresh_session"
+            controller._session_id = None
+            controller._do_request("/mcp/models", timeout=5, allow_session_retry=True)
+            mock_session.assert_called_once()
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.get_header("X-api-key") is None
+        cookie = request.get_header("Cookie", "")
+        assert "session_id=fresh_session" in cookie
+        assert "session_id=None" not in cookie
+
+    @patch("urllib.request.urlopen")
+    def test_api_key_auth_method_still_sends_key(self, mock_urlopen):
+        from mcp_server_odoo.config import OdooConfig
+
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="good_key",
+            database="test_db",
+        )
+        controller = AccessController(config, auth_method="api_key")
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"success": True, "data": {"models": []}}
+        ).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_response
+
+        controller._do_request("/mcp/models", timeout=5, allow_session_retry=True)
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.get_header("X-api-key") == "good_key"
+
+    @patch("urllib.request.urlopen")
+    def test_infrastructure_failure_is_not_reported_as_denial(self, mock_urlopen, controller):
+        """A network outage must surface as 'could not evaluate', not 'denied'."""
+        import urllib.error
+
+        from mcp_server_odoo.access_control import AccessControlUnavailableError
+
+        mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+
+        with pytest.raises(AccessControlUnavailableError, match="Connection error"):
+            controller.check_operation_allowed("res.partner", "read")
+
+        # validate_model_access propagates the same distinction (fail closed,
+        # but retryable connection error rather than a permission denial)
+        with pytest.raises(AccessControlUnavailableError):
+            controller.validate_model_access("res.partner", "read")
+
+    @patch("urllib.request.urlopen")
+    def test_genuine_denial_still_reads_as_denial(self, mock_urlopen, controller):
+        """403 from the MCP endpoints remains a plain denial."""
+        import urllib.error
+
+        from mcp_server_odoo.access_control import (
+            AccessControlError,
+            AccessControlUnavailableError,
+        )
+
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="http://test", code=403, msg="Forbidden", hdrs=None, fp=None
+        )
+
+        allowed, msg = controller.check_operation_allowed("res.partner", "read")
+        assert allowed is False
+        assert "Access denied" in msg
+
+        with pytest.raises(AccessControlError) as exc_info:
+            controller.validate_model_access("res.partner", "read")
+        # 403 must not classify as infrastructure failure
+        assert not isinstance(exc_info.value, AccessControlUnavailableError)
 
     @patch("urllib.request.urlopen")
     def test_check_operation_model_disabled(self, mock_urlopen, controller):
@@ -565,7 +708,6 @@ class TestSessionAuth:
 
 
 @pytest.mark.mcp
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 class TestAccessControlIntegration:
     """Integration tests with real Odoo server."""
 
@@ -587,14 +729,12 @@ class TestAccessControlIntegration:
 
         models = controller.get_enabled_models()
 
-        assert isinstance(models, list)
+        assert models, "MCP test instance must have at least one enabled model"
         print(f"Found {len(models)} enabled models")
 
-        # Just verify we got some models
-        if models:
-            # Print first few models as example
-            for model in models[:3]:
-                print(f"  - {model.get('model', 'unknown')}")
+        # Each entry must identify a model
+        for model in models:
+            assert model.get("model"), f"enabled model entry without model name: {model}"
 
     def test_real_model_permissions(self, real_config, readable_model):
         """Test getting model permissions from real server."""
@@ -675,3 +815,37 @@ class TestAccessControlIntegration:
 if __name__ == "__main__":
     # Run integration tests when executed directly
     pytest.main([__file__, "-v", "-k", "Integration"])
+
+
+class TestAccessDeniedMessage:
+    """The MCP module labels its own refusals; do not label them twice."""
+
+    def test_self_labelled_refusal_is_not_double_prefixed(self):
+        e = AccessControlError(
+            "Access denied: your user is not authorized for MCP. "
+            "Ask your Odoo administrator for the 'MCP User' group."
+        )
+
+        message = access_denied_message(e)
+
+        assert message.lower().count("access denied") == 1
+        assert message.startswith("Access denied: your user is not authorized")
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["Access denied", "access denied: nope", "ACCESS DENIED: nope"],
+        ids=["bare", "lower", "upper"],
+    )
+    def test_prefix_detection_is_case_insensitive(self, raw):
+        assert (
+            not access_denied_message(AccessControlError(raw))
+            .lower()
+            .startswith("access denied: access denied")
+        )
+
+    def test_unlabelled_refusal_gets_the_prefix(self):
+        e = AccessControlError("Operation 'create' not allowed on model 'res.partner'")
+
+        assert access_denied_message(e) == (
+            "Access denied: Operation 'create' not allowed on model 'res.partner'"
+        )

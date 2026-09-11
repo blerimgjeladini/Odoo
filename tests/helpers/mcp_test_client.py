@@ -15,6 +15,7 @@ from mcp.types import (
     CallToolResult,
     Resource,
     TextContent,
+    TextResourceContents,
     Tool,
 )
 
@@ -34,6 +35,7 @@ class MCPTestClient:
         # Use python module directly since package isn't published
         self.server_command = server_command or [sys.executable, "-m", "mcp_server_odoo"]
         self.session: Optional[ClientSession] = None
+        self.initialize_result = None  # InitializeResult from the last connect()
         self._server_process: Optional[subprocess.Popen] = None
 
     @asynccontextmanager
@@ -52,8 +54,9 @@ class MCPTestClient:
                 async with ClientSession(read, write) as session:
                     self.session = session
 
-                    # Initialize the connection
-                    await session.initialize()
+                    # Initialize the connection (keep the result — it carries
+                    # the server's instructions and capabilities)
+                    self.initialize_result = await session.initialize()
                     logger.info("Connected to MCP server")
 
                     yield self
@@ -86,10 +89,11 @@ class MCPTestClient:
 
         result = await self.session.read_resource(uri)
 
-        # Extract text content
+        # Extract text content (resource reads return TextResourceContents,
+        # not the TextContent type used by tool results)
         if result.contents:
             for content in result.contents:
-                if isinstance(content, TextContent):
+                if isinstance(content, TextResourceContents):
                     return content.text
 
         return ""

@@ -6,7 +6,7 @@ for connecting to Odoo via XML-RPC.
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
@@ -40,15 +40,29 @@ class OdooConfig:
     host: str = "localhost"
     port: int = 8000
 
+    # Idle seconds before a streamable-http session is evicted (None = never).
+    # Without it, abandoned sessions pin their transport state (streams,
+    # task, server instance) in the session manager until process restart.
+    session_idle_timeout: Optional[float] = None
+
     # YOLO mode configuration
     yolo_mode: str = "off"  # "off", "read", or "true"
 
     # Opt-in for call_model_method (effective only with yolo_mode == "true").
     enable_method_calls: bool = False
 
+    # Allowed hosts for DNS rebinding protection (HTTP transport)
+    allowed_hosts: list[str] = field(default_factory=list)
+
+    # Ceiling on a single binary resources/read (bytes). The read decodes the
+    # payload and the MCP layer re-encodes it to base64, so peak memory runs
+    # ~2.3x the stored size — one oversized attachment can take the process
+    # down. Now that populated binaries are advertised as odoo:// URIs, a
+    # client will follow them, so the ceiling is enforced rather than assumed.
+    max_binary_size: int = 50 * 1024 * 1024
+
     def __post_init__(self):
         """Validate configuration after initialization."""
-        # Validate URL
         if not self.url:
             raise ValueError("ODOO_URL is required")
 
@@ -56,7 +70,6 @@ class OdooConfig:
         if not self.url.startswith(("http://", "https://")):
             raise ValueError("ODOO_URL must start with http:// or https://")
 
-        # Validate YOLO mode
         valid_yolo_modes = {"off", "read", "true"}
         if self.yolo_mode not in valid_yolo_modes:
             raise ValueError(
@@ -64,7 +77,6 @@ class OdooConfig:
                 f"Must be one of: {', '.join(valid_yolo_modes)}"
             )
 
-        # Validate authentication (relaxed for YOLO mode)
         has_api_key = bool(self.api_key)
         has_credentials = bool(self.username and self.password)
 
@@ -79,7 +91,6 @@ class OdooConfig:
                     "both ODOO_USER and ODOO_PASSWORD"
                 )
 
-        # Validate numeric fields
         if self.default_limit <= 0:
             raise ValueError("ODOO_MCP_DEFAULT_LIMIT must be positive")
 
@@ -89,7 +100,6 @@ class OdooConfig:
         if self.default_limit > self.max_limit:
             raise ValueError("ODOO_MCP_DEFAULT_LIMIT cannot exceed ODOO_MCP_MAX_LIMIT")
 
-        # Validate log level
         valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         if self.log_level.upper() not in valid_log_levels:
             raise ValueError(
@@ -97,7 +107,6 @@ class OdooConfig:
                 f"Must be one of: {', '.join(valid_log_levels)}"
             )
 
-        # Validate transport
         valid_transports = {"stdio", "streamable-http"}
         if self.transport not in valid_transports:
             raise ValueError(
@@ -105,9 +114,15 @@ class OdooConfig:
                 f"Must be one of: {', '.join(valid_transports)}"
             )
 
-        # Validate port
         if self.port <= 0 or self.port > 65535:
             raise ValueError("Port must be between 1 and 65535")
+
+        # Validate session idle timeout
+        if self.session_idle_timeout is not None and self.session_idle_timeout <= 0:
+            raise ValueError("ODOO_MCP_SESSION_IDLE_TIMEOUT must be positive")
+
+        if self.max_binary_size <= 0:
+            raise ValueError("ODOO_MCP_MAX_BINARY_SIZE must be positive")
 
         # Without this warning, the silent non-registration is hard to debug.
         if self.enable_method_calls and self.yolo_mode != "true":
@@ -218,6 +233,15 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         except ValueError:
             raise ValueError(f"{key} must be a valid integer") from None
 
+    def get_optional_float_env(key: str) -> Optional[float]:
+        value = os.getenv(key)
+        if value is None or not value.strip():
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a valid number") from None
+
     def get_bool_env(key: str, default: bool = False) -> bool:
         raw = os.getenv(key)
         if raw is None:
@@ -238,7 +262,13 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
             # Invalid value - will be caught by validation
             return yolo_env
 
-    # Create configuration
+    # Helper function to parse allowed hosts
+    def parse_allowed_hosts() -> list[str]:
+        hosts = os.getenv("ODOO_MCP_ALLOWED_HOSTS", "").strip()
+        if not hosts:
+            return []
+        return [h.strip() for h in hosts.split(",") if h.strip()]
+
     config = OdooConfig(
         url=os.getenv("ODOO_URL", "").strip(),
         api_key=os.getenv("ODOO_API_KEY", "").strip() or None,
@@ -252,9 +282,12 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         transport=os.getenv("ODOO_MCP_TRANSPORT", "stdio").strip(),
         host=os.getenv("ODOO_MCP_HOST", "localhost").strip(),
         port=get_int_env("ODOO_MCP_PORT", 8000),
+        session_idle_timeout=get_optional_float_env("ODOO_MCP_SESSION_IDLE_TIMEOUT"),
         locale=os.getenv("ODOO_LOCALE", "").strip() or None,
         yolo_mode=get_yolo_mode(),
         enable_method_calls=get_bool_env("ODOO_MCP_ENABLE_METHOD_CALLS", False),
+        allowed_hosts=parse_allowed_hosts(),
+        max_binary_size=get_int_env("ODOO_MCP_MAX_BINARY_SIZE", 50 * 1024 * 1024),
     )
 
     return config
@@ -271,7 +304,7 @@ def get_config() -> OdooConfig:
         OdooConfig: The configuration object
 
     Raises:
-        ValueError: If configuration is not yet loaded
+        ValueError: If configuration cannot be loaded or is invalid.
     """
     global _config
     if _config is None:
@@ -298,3 +331,28 @@ def reset_config() -> None:
     """
     global _config
     _config = None
+
+
+# Deep pagination is query-cost amplification: Postgres still walks (and
+# discards) every skipped row, so a huge offset is expensive even though the
+# limit is capped. Reject offsets beyond this many pages of the effective
+# limit — generous for real paging, but it stops an ``offset=999999999``
+# forcing an unbounded skip.
+MAX_OFFSET_PAGES = 1000
+
+# Floor for the offset cap: small-limit deep pagination (fetch-the-Nth-record
+# with limit=1) must not fail shallower than a larger page size would —
+# without the floor, ``limit=1, offset=1500`` would be rejected while
+# ``limit=100`` reaches the same depth fine.
+MIN_OFFSET_CAP = 10_000
+
+
+def max_offset_for(limit: int) -> int:
+    """The deepest offset accepted for a given page size.
+
+    ``MAX_OFFSET_PAGES`` pages of the effective limit, floored at
+    ``MIN_OFFSET_CAP``. Lives beside the other paging limits rather than in
+    ``tools``: the read-only resource layer enforces the same bound and must
+    not import from the write-capable tool layer to get it.
+    """
+    return max(limit * MAX_OFFSET_PAGES, MIN_OFFSET_CAP)

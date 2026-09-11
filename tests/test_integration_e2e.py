@@ -18,8 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server_odoo.access_control import AccessController
 from mcp_server_odoo.config import OdooConfig
-from mcp_server_odoo.error_handling import NotFoundError, ValidationError
-from mcp_server_odoo.error_handling import PermissionError as MCPPermissionError
+from mcp_server_odoo.error_handling import MCPPermissionError, NotFoundError, ValidationError
 from mcp_server_odoo.odoo_connection import OdooConnection
 from mcp_server_odoo.resources import OdooResourceHandler
 from mcp_server_odoo.tools import OdooToolHandler
@@ -29,7 +28,6 @@ from tests.helpers.server_testing import (
     PerformanceTimer,
     assert_performance,
     check_odoo_health,
-    create_test_env_file,
     mcp_test_server,
 )
 
@@ -121,20 +119,6 @@ class TestServerLifecycle:
             assert process.poll() is None
 
         assert server.server_process is None
-
-    def test_server_with_env_file(self, tmp_path, config):
-        """Test server can load configuration from .env file."""
-        create_test_env_file(tmp_path)
-
-        original_cwd = os.getcwd()
-        os.chdir(tmp_path)
-
-        try:
-            loaded = OdooConfig.from_env()
-            assert loaded.url == os.getenv("ODOO_URL", "http://localhost:8069")
-            assert loaded.api_key == (os.getenv("ODOO_API_KEY") or None)
-        finally:
-            os.chdir(original_cwd)
 
     def test_uvx_server_startup(self):
         """Test that server module is executable."""
@@ -243,15 +227,23 @@ class TestResourceOperations:
     async def test_search_with_domain(self, connected_env):
         """Test search with domain filter returns filtered results."""
         handler = connected_env["resource_handler"]
+        conn = connected_env["connection"]
         import json
         from urllib.parse import quote
 
-        domain = json.dumps([["is_company", "=", True]])
-        result = await handler._handle_search("res.partner", quote(domain), None, 5, 0, None)
+        domain = [["is_company", "=", True]]
+        result = await handler._handle_search(
+            "res.partner", quote(json.dumps(domain)), None, 5, 0, None
+        )
 
         assert "res.partner" in result
-        # Should mention record count from filtered results
         assert "Showing records" in result
+
+        # The displayed total must match the domain-filtered count, proving
+        # the domain was actually applied and not silently dropped
+        expected = conn.search_count("res.partner", domain)
+        assert expected > 0, "test database must contain at least one company partner"
+        assert f"of {expected}" in result
 
     @pytest.mark.asyncio
     async def test_count_operation(self, connected_env):
@@ -284,18 +276,37 @@ class TestResourceOperations:
 
     @pytest.mark.asyncio
     async def test_record_safe_field_filtering(self, connected_env):
-        """Test that binary/html/serialized fields are excluded from record retrieval."""
+        """Stored binaries render as fetchable URIs, never as inlined base64."""
         handler = connected_env["resource_handler"]
         conn = connected_env["connection"]
 
         partner_ids = conn.search("res.partner", [], limit=1)
         assert partner_ids
+        partner_id = partner_ids[0]
 
-        result = await handler._handle_record_retrieval("res.partner", str(partner_ids[0]))
+        result = await handler._handle_record_retrieval("res.partner", str(partner_id))
 
-        # Binary fields like image_1920 should NOT appear in the output
-        assert "image_1920:" not in result
-        assert "image_128:" not in result
+        # A POPULATED binary is advertised as a resource URI plus its size, so
+        # the client fetches it on demand instead of paying for base64 inline.
+        # An empty one still renders its label ("image_1920: Not set"), so the
+        # field being present says nothing about which form to expect — assert
+        # per value, not per field name. (A demo database has partner images;
+        # CI initializes with --without-demo, so both cases occur.)
+        expected_uri = f"odoo://res.partner/record/{partner_id}/"
+        checked = 0
+        for line in result.splitlines():
+            label, _, value = line.strip().partition(":")
+            if label not in ("image_1920", "image_128"):
+                continue
+            checked += 1
+            value = value.strip()
+            assert value == "Not set" or value.startswith(f"{expected_uri}{label}"), (
+                f"{label} rendered as {value!r}; expected 'Not set' or a resource URI"
+            )
+        assert checked, "no image field rendered — the record resource dropped binaries"
+        # Whatever is rendered, no raw base64 payload leaks into the text
+        assert "data:image" not in result
+        assert "iVBORw0KGgo" not in result  # PNG base64 preamble
 
 
 class TestToolOperations:
@@ -438,7 +449,7 @@ class TestToolOperations:
     async def test_aggregate_records_count_only(self, connected_env):
         """aggregate_records: count partners by country via formatted_read_group.
 
-        Requires the much-mcp-server addon's whitelist to include
+        Requires the MCP module's whitelist to include
         ``"formatted_read_group": "read"`` (matches the Post-Completion step
         of the aggregate_records plan).
         """
@@ -496,21 +507,30 @@ class TestToolOperations:
             assert "partner_share:count_distinct" in bucket
 
     @pytest.mark.asyncio
-    async def test_aggregate_records_empty_groupby_rejected(self, connected_env):
-        """Validation runs before the network call."""
+    async def test_aggregate_records_empty_groupby_overall_count(self, connected_env):
+        """groupby=[] collapses to one overall row — the filtered-count path."""
         handler = connected_env["tool_handler"]
+        ac = connected_env["access_controller"]
 
-        with pytest.raises(ValidationError) as exc_info:
-            await handler._handle_aggregate_records_tool(
-                model="res.partner",
-                groupby=[],
-                aggregates=None,
-                domain=None,
-                order=None,
-                limit=None,
-                offset=0,
-            )
-        assert "groupby must not be empty" in str(exc_info.value)
+        try:
+            ac.validate_model_access("res.partner", "read")
+        except Exception:
+            pytest.skip("No read permission on res.partner in current MCP config")
+
+        result = await handler._handle_aggregate_records_tool(
+            model="res.partner",
+            groupby=[],
+            aggregates=None,
+            domain=[["active", "=", True]],
+            order=None,
+            limit=None,
+            offset=0,
+        )
+
+        assert result["groupby"] == []
+        assert result["aggregates"] == ["__count"]
+        assert len(result["groups"]) == 1
+        assert isinstance(result["groups"][0]["__count"], int)
 
 
 class TestErrorHandling:

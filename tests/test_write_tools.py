@@ -197,6 +197,28 @@ class TestWriteTools:
         mock_connection.read.assert_called_once_with(model, [record_id], ["id", "display_name"])
 
     @pytest.mark.asyncio
+    async def test_delete_record_without_display_name(self, tool_handler, mock_connection):
+        """Records without a display name (e.g. mail.message) return False —
+        the result must fall back to an ID label, not crash DeleteResult
+        validation AFTER the unlink already succeeded.
+
+        Found in manual testing: deleting a mail.message deleted the record
+        but returned a Pydantic error, leaving the client believing the
+        delete failed.
+        """
+        from mcp_server_odoo.schemas import DeleteResult
+
+        mock_connection.read.return_value = [{"id": 6115, "display_name": False}]
+        mock_connection.unlink.return_value = True
+
+        result = await tool_handler._handle_delete_record_tool("mail.message", 6115)
+
+        assert result["success"] is True
+        assert result["deleted_name"] == "ID 6115"
+        # The dict must validate against the declared result schema
+        DeleteResult(**result)
+
+    @pytest.mark.asyncio
     async def test_delete_record_not_found(self, tool_handler, mock_connection):
         """Test delete record that doesn't exist."""
         mock_connection.read.return_value = []
@@ -629,6 +651,38 @@ class TestWriteToolsIntegration:
             except Exception:
                 pass
 
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_post_message_subject_stored(self, real_tool_handler):
+        """subject= forwards to message_post and lands on mail.message.subject."""
+        handler = real_tool_handler
+
+        partner_ids = handler.connection.search("res.partner", [], limit=1)
+        assert partner_ids, "Need at least one res.partner for this test"
+        partner_id = partner_ids[0]
+
+        result = await handler._handle_post_message_tool(
+            "res.partner",
+            partner_id,
+            "MCP integration test: message with subject",
+            "note",
+            "comment",
+            None,
+            None,
+            False,
+            subject="MCP subject test",
+        )
+        message_id = result["message_id"]
+
+        try:
+            messages = handler.connection.read("mail.message", [message_id], ["subject"])
+            assert messages[0]["subject"] == "MCP subject test"
+        finally:
+            try:
+                handler.connection.unlink("mail.message", [message_id])
+            except Exception:
+                pass
+
 
 class TestCallModelMethodIntegration:
     """YOLO integration tests for the gated call_model_method tool.
@@ -746,27 +800,55 @@ class TestCallModelMethodIntegration:
 
     @pytest.mark.yolo
     @pytest.mark.asyncio
-    async def test_kwargs_path_via_read_with_context(self, real_tool_handler):
-        """``keyword_arguments`` reach execute_kw — exercise via ``read`` (universal across 17/18/19)."""
+    async def test_kwargs_path_via_toggle_active_with_context(self, real_tool_handler):
+        """``keyword_arguments`` reach execute_kw — a context kwarg rides along toggle_active.
+
+        (``read`` used to be the vehicle here, but ORM data-access primitives
+        are now denylisted; any method accepts a ``context`` kwarg via execute_kw.)
+        """
         handler = real_tool_handler
 
-        partner_ids = handler.connection.search("res.partner", [], limit=1)
-        if not partner_ids:
-            pytest.skip("Need at least one res.partner for this test")
-        partner_id = partner_ids[0]
-
-        result = await handler._handle_call_model_method_tool(
-            "res.partner",
-            "read",
-            [[partner_id], ["name"]],
-            {"context": {"lang": "en_US"}},
+        create_result = await handler._handle_create_record_tool(
+            "res.partner", {"name": "MCP CallMethod kwargs"}
         )
+        partner_id = create_result["record"]["id"]
 
-        assert result["success"] is True
-        assert isinstance(result["result"], list) and result["result"], (
-            f"expected non-empty list of dicts, got {result['result']!r}"
-        )
-        assert "name" in result["result"][0]
+        try:
+            result = await handler._handle_call_model_method_tool(
+                "res.partner",
+                "toggle_active",
+                [[partner_id]],
+                {"context": {"lang": "en_US"}},
+            )
+            assert result["success"] is True
+            row = handler.connection.read("res.partner", [partner_id], ["active"])
+            assert row[0]["active"] is False, "expected partner deactivated"
+        finally:
+            try:
+                handler.connection.unlink("res.partner", [partner_id])
+            except Exception:
+                pass
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_denylisted_calls_rejected_live(self, real_tool_handler):
+        """Blocked models/methods are refused before any RPC happens."""
+        from mcp_server_odoo.error_handling import ValidationError
+
+        handler = real_tool_handler
+
+        with pytest.raises(ValidationError, match="elevated privileges"):
+            await handler._handle_call_model_method_tool("ir.actions.server", "run", [[1]], None)
+        with pytest.raises(ValidationError, match="elevated privileges"):
+            await handler._handle_call_model_method_tool(
+                "ir.cron", "method_direct_trigger", [[1]], None
+            )
+        with pytest.raises(ValidationError, match=r"web_\* data-access family"):
+            await handler._handle_call_model_method_tool("res.partner", "web_read", [[1]], None)
+        with pytest.raises(ValidationError, match="ORM data-access primitive"):
+            await handler._handle_call_model_method_tool(
+                "res.partner", "create", [[{"name": "x"}]], None
+            )
 
     @pytest.mark.yolo
     @pytest.mark.asyncio
@@ -867,8 +949,7 @@ class TestPostMessageMCPIntegration:
         message_id = result["message_id"]
         assert isinstance(message_id, int) and message_id > 0
 
-        # Verification reads mail.message, which not every MCP deployment exposes.
-        # If it isn't enabled, treat the round-trip success as sufficient.
+        # Verification reads mail.message, which not every MCP deployment exposes
         try:
             messages = handler.connection.search_read(
                 "mail.message",
@@ -877,7 +958,7 @@ class TestPostMessageMCPIntegration:
             )
         except OdooConnectionError as e:
             if "Permission denied" in str(e) or "Access denied" in str(e):
-                return  # mail.message not exposed via MCP — post itself succeeded
+                pytest.skip("mail.message not exposed via MCP — post succeeded but unverifiable")
             raise
 
         try:
@@ -913,7 +994,9 @@ class TestPostMessageMCPIntegration:
                 None,
                 False,
             )
+            assert result["success"] is True
             message_id = result["message_id"]
+            assert isinstance(message_id, int) and message_id > 0
         except ValidationError as e:
             err = str(e)
             if "mail.thread" in err:
@@ -923,7 +1006,7 @@ class TestPostMessageMCPIntegration:
             raise
 
         # Verification reads mail.message and ir.model.data, neither of which
-        # every MCP deployment exposes. Skip gracefully when they aren't.
+        # every MCP deployment exposes. Skip visibly when they aren't.
         try:
             messages = handler.connection.search_read(
                 "mail.message",
@@ -932,7 +1015,7 @@ class TestPostMessageMCPIntegration:
             )
         except OdooConnectionError as e:
             if "Permission denied" in str(e) or "Access denied" in str(e):
-                return  # mail.message not exposed via MCP — post itself succeeded
+                pytest.skip("mail.message not exposed via MCP — subtype unverifiable")
             raise
 
         try:
@@ -951,7 +1034,7 @@ class TestPostMessageMCPIntegration:
                 )
             except OdooConnectionError as e:
                 if "Permission denied" in str(e) or "Access denied" in str(e):
-                    return  # ir.model.data not exposed — leave subtype_id-level assertion only
+                    pytest.skip("ir.model.data not exposed via MCP — subtype name unverifiable")
                 raise
 
             assert any(

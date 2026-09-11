@@ -45,7 +45,7 @@ def main(argv: Optional[list[str]] = None) -> int:
   ODOO_LOCALE        Locale for formatting (e.g. en_US, de_DE)
 
 Optional environment variables:
-  ODOO_MCP_LOG_LEVEL       Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
+  ODOO_MCP_LOG_LEVEL       Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
   ODOO_MCP_LOG_JSON        Enable structured JSON log output (default: false)
   ODOO_MCP_LOG_FILE        Path for rotating log file (10 MB, 5 backups)
   ODOO_MCP_DEFAULT_LIMIT   Default record limit (default: 10)
@@ -54,6 +54,13 @@ Optional environment variables:
   ODOO_MCP_TRANSPORT       Transport type: stdio or streamable-http (default: stdio)
   ODOO_MCP_HOST            Server host for HTTP transports (default: localhost)
   ODOO_MCP_PORT            Server port for HTTP transports (default: 8000)
+  ODOO_MCP_ENABLE_METHOD_CALLS  Enable call_model_method tool, requires ODOO_YOLO=true (default: false)
+  ODOO_MCP_ALLOWED_HOSTS   Comma-separated list of allowed Host headers for
+                           DNS rebinding protection (e.g., odoo.example.com,localhost)
+  ODOO_MCP_SESSION_IDLE_TIMEOUT  Seconds of inactivity before an HTTP session
+                           is closed and its resources freed (default: never)
+  ODOO_MCP_MAX_BINARY_SIZE Max bytes for one binary/attachment resource read
+                           (default: 52428800 = 50 MB)
 
 For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
     )
@@ -64,36 +71,41 @@ For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
         version=f"odoo-mcp-server v{SERVER_VERSION}",
     )
 
+    # CLI flags default to None sentinels: load_config() resolves the
+    # actual values from the environment AND the .env file. Eagerly
+    # baking env values into argparse defaults (and writing them back to
+    # os.environ below) would mask .env settings, because load_dotenv()
+    # never overrides variables already present in the environment.
     parser.add_argument(
         "--transport",
         choices=["stdio", "streamable-http"],
-        default=os.getenv("ODOO_MCP_TRANSPORT", "stdio"),
-        help="Transport type to use (default: stdio)",
+        default=None,
+        help="Transport type to use (default: stdio; env: ODOO_MCP_TRANSPORT)",
     )
 
     parser.add_argument(
         "--host",
-        default=os.getenv("ODOO_MCP_HOST", "localhost"),
-        help="Server host for HTTP transports (default: localhost)",
+        default=None,
+        help="Server host for HTTP transports (default: localhost; env: ODOO_MCP_HOST)",
     )
 
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("ODOO_MCP_PORT", "8000")),
-        help="Server port for HTTP transports (default: 8000)",
+        default=None,
+        help="Server port for HTTP transports (default: 8000; env: ODOO_MCP_PORT)",
     )
 
     # Parse arguments
     args = parser.parse_args(argv)
 
     try:
-        # Override environment variables with CLI arguments
-        if args.transport:
+        # Override environment variables with explicitly-passed CLI arguments
+        if args.transport is not None:
             os.environ["ODOO_MCP_TRANSPORT"] = args.transport
-        if args.host:
+        if args.host is not None:
             os.environ["ODOO_MCP_HOST"] = args.host
-        if args.port:
+        if args.port is not None:
             os.environ["ODOO_MCP_PORT"] = str(args.port)
 
         # Load configuration from environment
@@ -106,7 +118,7 @@ For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
         if config.transport == "stdio":
             asyncio.run(server.run_stdio())
         elif config.transport == "streamable-http":
-            asyncio.run(server.run_http(host=config.host, port=config.port))
+            asyncio.run(server.run_http())
         else:
             raise ValueError(f"Unsupported transport: {config.transport}")
 
