@@ -2990,13 +2990,11 @@ class TestUpdateRecordsTool:
     @pytest.mark.asyncio
     async def test_update_records_success(self, handler, mock_connection, mock_app):
         """Test successful bulk update with existence check and result read."""
-        mock_connection.read.side_effect = [
-            [{"id": 10}, {"id": 11}],  # existence check
-            [
-                {"id": 10, "display_name": "Partner 10"},
-                {"id": 11, "display_name": "Partner 11"},
-            ],  # post-update read
-        ]
+        mock_connection.search.return_value = [10, 11]  # existence check
+        mock_connection.read.return_value = [
+            {"id": 10, "display_name": "Partner 10"},
+            {"id": 11, "display_name": "Partner 11"},
+        ]  # post-update read
         mock_connection.write.return_value = True
 
         update_records = mock_app._tools["update_records"]
@@ -3035,7 +3033,7 @@ class TestUpdateRecordsTool:
     @pytest.mark.asyncio
     async def test_update_records_missing_id_rejected(self, handler, mock_connection, mock_app):
         """A nonexistent id in the batch fails the whole call, naming it, with no write."""
-        mock_connection.read.return_value = [{"id": 10}]  # 11 missing
+        mock_connection.search.return_value = [10]  # 11 missing
         update_records = mock_app._tools["update_records"]
         with pytest.raises(ValidationError, match=r"not found.*\[11\]"):
             await update_records(model="res.partner", record_ids=[10, 11], values={"name": "Test"})

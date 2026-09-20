@@ -2371,9 +2371,15 @@ class OdooToolHandler:
 
                 # Check every record exists before writing — a partial batch
                 # write with no rollback signal would be worse than failing
-                # up front and naming what's missing.
-                existing = await asyncio.to_thread(self.connection.read, model, record_ids, ["id"])
-                existing_ids = {rec["id"] for rec in existing}
+                # up front and naming what's missing. Uses search(), not
+                # read(model, ids, ["id"]): reading only the id field never
+                # touches the table, so Odoo echoes it back for ids that
+                # don't exist instead of raising or omitting them.
+                existing_ids = set(
+                    await asyncio.to_thread(
+                        self.connection.search, model, [["id", "in", record_ids]]
+                    )
+                )
                 missing_ids = [rid for rid in record_ids if rid not in existing_ids]
                 if missing_ids:
                     raise NotFoundError(f"Record(s) not found: {model} with ID(s) {missing_ids}")
